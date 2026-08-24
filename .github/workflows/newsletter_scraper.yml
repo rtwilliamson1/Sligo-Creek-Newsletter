@@ -3,9 +3,13 @@ name: Newsletter scraper email
 on:
   workflow_dispatch: {}
   schedule:
-    # Runs 13:00 UTC daily. Adjust to match how often the newsletter is
-    # actually published (Smore flyers are often weekly).
+    # Runs 13:00 UTC daily. The script only emails when a new issue's slug
+    # differs from the last one it processed (tracked in .state/last_slug.txt),
+    # so a frequent schedule is safe even if the newsletter itself is weekly.
     - cron: "0 13 * * *"
+
+permissions:
+  contents: write
 
 jobs:
   scrape-and-email:
@@ -22,7 +26,7 @@ jobs:
 
       - name: Run scraper
         env:
-          NEWSLETTER_URL: ${{ vars.NEWSLETTER_URL }}
+          NEWSLETTER_SENDER: ${{ vars.NEWSLETTER_SENDER }}
           EMAIL_TO: ${{ vars.EMAIL_TO }}
           EMAIL_FROM: ${{ vars.EMAIL_FROM }}
           SMTP_HOST: ${{ vars.SMTP_HOST }}
@@ -31,3 +35,13 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python newsletter_scraper.py
+
+      - name: Commit updated state
+        run: |
+          if ! git diff --quiet -- .state; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .state
+            git commit -m "Record last processed newsletter issue [skip ci]"
+            git push
+          fi

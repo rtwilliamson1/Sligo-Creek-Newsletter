@@ -1,28 +1,44 @@
 #!/usr/bin/env python3
 """
-Scrape a Smore newsletter (or similar single-page flyer) and email the key
-info to yourself.
+Find the latest Sligo Creek newsletter (a Smore flyer whose URL changes with
+every issue), scrape it, and email the key info to yourself.
+
+Each issue is announced by a ParentSquare email whose "view newsletter"
+button is a tracking link that redirects (through one or more hops) to the
+actual app.smore.com flyer. Rather than hardcoding a URL, this script reads
+the most recent matching email from your inbox via IMAP and follows the
+redirect chain to find the current flyer.
 
 Usage:
     python newsletter_scraper.py
-    python newsletter_scraper.py --url https://app.smore.com/n/dpguw --dry-run
+    python newsletter_scraper.py --dry-run
+    python newsletter_scraper.py --url https://app.smore.com/n/xxxxx --dry-run
+    python newsletter_scraper.py --force   # re-send even if already processed
 
 Configuration is read from environment variables (see .env.example):
-    NEWSLETTER_URL      Smore flyer URL to scrape (default: the one below)
-    EMAIL_TO            Recipient address (default: rtwilliamson@gmail.com)
-    EMAIL_FROM          "From" address (defaults to SMTP_USERNAME)
-    SMTP_HOST           SMTP server, e.g. smtp.gmail.com
-    SMTP_PORT           SMTP port, e.g. 587
-    SMTP_USERNAME        SMTP login
-    SMTP_PASSWORD       SMTP password / app password
-    ANTHROPIC_API_KEY   Optional. If set, Claude is used to turn the raw
-                         scraped text into a clean "key info" digest. If
-                         unset, a simple heuristic extractor is used instead.
+    NEWSLETTER_SENDER  Sender address of the newsletter notification email
+                        (default: ParentSquare's Sligo Creek sender)
+    IMAP_HOST          IMAP server, e.g. imap.gmail.com (default: imap.gmail.com)
+    IMAP_PORT          IMAP port (default: 993)
+    EMAIL_TO           Recipient address (default: rtwilliamson@gmail.com)
+    EMAIL_FROM         "From" address (defaults to SMTP_USERNAME)
+    SMTP_HOST          SMTP server, e.g. smtp.gmail.com
+    SMTP_PORT          SMTP port, e.g. 587
+    SMTP_USERNAME      Gmail login, reused for both SMTP (send) and IMAP (read)
+    SMTP_PASSWORD      Gmail App Password, reused for both SMTP and IMAP
+    STATE_FILE         Where the last-processed flyer slug is recorded, to
+                        avoid re-sending a digest for the same issue
+                        (default: .state/last_slug.txt)
+    ANTHROPIC_API_KEY  Optional. If set, Claude is used to turn the raw
+                        scraped text into a clean "key info" digest. If
+                        unset, a simple heuristic extractor is used instead.
 """
 
 from __future__ import annotations
 
 import argparse
+import email as email_lib
+import imaplib
 import json
 import os
 import re
@@ -35,10 +51,22 @@ from email.mime.text import MIMEText
 import requests
 from bs4 import BeautifulSoup
 
-DEFAULT_URL = "https://app.smore.com/n/dpguw"
+DEFAULT_SENDER = "donotreply+c75680a1-bc11-5aab-8d22-8381a21f2834@parentsquare.com"
+STATE_FILE = os.environ.get("STATE_FILE", ".state/last_slug.txt")
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+LINK_BLOCKLIST_KEYWORDS = (
+    "unsubscribe",
+    "mailto:",
+    "facebook.com",
+    "twitter.com",
+    "x.com",
+    "instagram.com",
+    "linkedin.com",
+    "parentsquare.com/settings",
+    "parentsquare.com/notification",
 )
 
 
@@ -56,6 +84,113 @@ def fetch_html(url: str, timeout: int = 20) -> str:
     resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
     resp.raise_for_status()
     return resp.text
+
+
+def _extract_links_from_email(msg: email_lib.message.Message) -> list[str]:
+    html_body = None
+    text_body = None
+    parts = msg.walk() if msg.is_multipart() else [msg]
+    for part in parts:
+        if part.get_content_maintype() == "multipart":
+            continue
+        content_type = part.get_content_type()
+        if content_type not in ("text/html", "text/plain"):
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+        decoded = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+        if content_type == "text/html" and html_body is None:
+            html_body = decoded
+        elif content_type == "text/plain" and text_body is None:
+            text_body = decoded
+
+    links: list[str] = []
+    if html_body:
+        soup = BeautifulSoup(html_body, "html.parser")
+        links.extend(
+            a["href"].strip()
+            for a in soup.find_all("a", href=True)
+            if a["href"].strip().startswith(("http://", "https://"))
+        )
+    if text_body:
+        links.extend(re.findall(r"https?://\S+", text_body))
+
+    seen: set[str] = set()
+    filtered: list[str] = []
+    for link in links:
+        link = link.rstrip(").,;\"'")
+        if link in seen or any(kw in link.lower() for kw in LINK_BLOCKLIST_KEYWORDS):
+            continue
+        seen.add(link)
+        filtered.append(link)
+    return filtered
+
+
+def _resolve_smore_url(candidate_links: list[str], max_candidates: int = 15) -> str | None:
+    """Follow each candidate link's redirect chain (tracking links often hop
+    through more than one service) until one lands on a smore.com URL."""
+    for link in candidate_links[:max_candidates]:
+        try:
+            resp = requests.get(
+                link, headers={"User-Agent": USER_AGENT}, allow_redirects=True, timeout=15
+            )
+        except requests.RequestException:
+            continue
+        if "smore.com" in resp.url:
+            return resp.url
+        # Some hops land on an interstitial page rather than redirecting
+        # straight through; fall back to scanning it for the real link.
+        match = re.search(r"https?://app\.smore\.com/n/[A-Za-z0-9]+", resp.text)
+        if match:
+            return match.group(0)
+    return None
+
+
+def find_latest_newsletter_url(sender: str | None = None) -> str | None:
+    sender = sender or os.environ.get("NEWSLETTER_SENDER", DEFAULT_SENDER)
+    host = os.environ.get("IMAP_HOST", "imap.gmail.com")
+    port = int(os.environ.get("IMAP_PORT", "993"))
+    username = os.environ["SMTP_USERNAME"]
+    password = os.environ["SMTP_PASSWORD"]
+
+    with imaplib.IMAP4_SSL(host, port) as imap:
+        imap.login(username, password)
+        imap.select("INBOX")
+        status, data = imap.search(None, f'(FROM "{sender}")')
+        if status != "OK" or not data or not data[0]:
+            return None
+        uids = data[0].split()
+        latest_uid = uids[-1]  # IMAP UIDs increase with arrival order
+        status, msg_data = imap.fetch(latest_uid, "(RFC822)")
+        if status != "OK" or not msg_data or not msg_data[0]:
+            return None
+        raw_email = msg_data[0][1]
+
+    msg = email_lib.message_from_bytes(raw_email)
+    links = _extract_links_from_email(msg)
+    return _resolve_smore_url(links)
+
+
+def extract_slug(url: str) -> str:
+    match = re.search(r"/n/([A-Za-z0-9]+)", url)
+    return match.group(1) if match else url
+
+
+def read_state() -> str | None:
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
+
+
+def write_state(slug: str) -> None:
+    state_dir = os.path.dirname(STATE_FILE)
+    if state_dir:
+        os.makedirs(state_dir, exist_ok=True)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        f.write(slug)
 
 
 def _extract_embedded_json_text(soup: BeautifulSoup) -> str:
@@ -254,22 +389,50 @@ def send_email(subject: str, plain_body: str, html_body: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default=os.environ.get("NEWSLETTER_URL", DEFAULT_URL))
+    parser.add_argument(
+        "--url",
+        default=None,
+        help="Scrape this URL directly instead of discovering it from the inbox.",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Scrape and print the digest instead of sending an email.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Send even if this issue's slug matches the last one processed.",
+    )
     args = parser.parse_args()
 
-    print(f"Fetching {args.url} ...", file=sys.stderr)
-    newsletter = scrape(args.url)
+    if args.url:
+        url = args.url
+    else:
+        print("Searching inbox for the latest newsletter link ...", file=sys.stderr)
+        url = find_latest_newsletter_url()
+        if not url:
+            print(
+                "Couldn't find a newsletter email or resolve its link to a "
+                "smore.com URL. Try --url to scrape a known link directly.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Resolved: {url}", file=sys.stderr)
+
+    slug = extract_slug(url)
+    if not args.force and not args.dry_run and read_state() == slug:
+        print(f"Already sent the digest for this issue (slug {slug}); nothing new.", file=sys.stderr)
+        return 0
+
+    print(f"Fetching {url} ...", file=sys.stderr)
+    newsletter = scrape(url)
 
     print("Summarizing ...", file=sys.stderr)
     digest = summarize_with_claude(newsletter)
 
     plain, html = build_email_body(newsletter, digest)
-    subject = f"Newsletter digest: {newsletter.title or args.url}"
+    subject = f"Newsletter digest: {newsletter.title or url}"
 
     if args.dry_run:
         print(f"Subject: {subject}\n")
@@ -277,6 +440,7 @@ def main() -> int:
         return 0
 
     send_email(subject, plain, html)
+    write_state(slug)
     print(f"Email sent to {os.environ.get('EMAIL_TO', 'rtwilliamson@gmail.com')}", file=sys.stderr)
     return 0
 
