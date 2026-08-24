@@ -1,0 +1,33 @@
+name: Newsletter scraper email
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Runs 13:00 UTC daily. Adjust to match how often the newsletter is
+    # actually published (Smore flyers are often weekly).
+    - cron: "0 13 * * *"
+
+jobs:
+  scrape-and-email:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          NEWSLETTER_URL: ${{ vars.NEWSLETTER_URL }}
+          EMAIL_TO: ${{ vars.EMAIL_TO }}
+          EMAIL_FROM: ${{ vars.EMAIL_FROM }}
+          SMTP_HOST: ${{ vars.SMTP_HOST }}
+          SMTP_PORT: ${{ vars.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python newsletter_scraper.py
