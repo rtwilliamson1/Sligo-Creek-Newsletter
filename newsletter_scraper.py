@@ -27,11 +27,8 @@ Configuration is read from environment variables (see .env.example):
     SMTP_USERNAME      Gmail login, reused for both SMTP (send) and IMAP (read)
     SMTP_PASSWORD      Gmail App Password, reused for both SMTP and IMAP
     STATE_FILE         Where the last-processed flyer slug is recorded, to
-                        avoid re-sending a digest for the same issue
+                        avoid re-sending an email for the same issue
                         (default: .state/last_slug.txt)
-    ANTHROPIC_API_KEY  Optional. If set, Claude is used to turn the raw
-                        scraped text into a clean "key info" digest. If
-                        unset, a simple heuristic extractor is used instead.
 """
 
 from __future__ import annotations
@@ -278,90 +275,23 @@ def scrape(url: str) -> ScrapedNewsletter:
     )
 
 
-def summarize_with_claude(newsletter: ScrapedNewsletter) -> str:
-    """Ask Claude to turn the raw scrape into a clean key-info digest.
-    Falls back to naive extraction on any error (missing key, API failure)."""
-    try:
-        import anthropic
-    except ImportError:
-        return summarize_naively(newsletter)
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return summarize_naively(newsletter)
-
-    client = anthropic.Anthropic(api_key=api_key)
-    prompt = (
-        "Below is raw scraped text from a Smore newsletter/flyer. Extract the "
-        "key information a busy reader needs: headline/purpose, important "
-        "dates or deadlines, events, action items, and any names, links, or "
-        "contact info. Write it as short, skimmable bullet points grouped "
-        "under headers. Omit boilerplate, navigation text, and Smore's own "
-        "UI chrome (e.g. 'Create your own Smore flyer'). If a detail isn't "
-        "present, don't invent it.\n\n"
-        f"URL: {newsletter.url}\n"
-        f"Title: {newsletter.title}\n\n"
-        f"Raw text:\n{newsletter.raw_text[:12000]}"
-    )
-    try:
-        message = client.messages.create(
-            model="claude-sonnet-5",
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return "".join(block.text for block in message.content if hasattr(block, "text"))
-    except Exception as exc:  # noqa: BLE001 - fall back on any API problem
-        print(f"Claude summarization failed ({exc}); falling back to naive extraction.", file=sys.stderr)
-        return summarize_naively(newsletter)
-
-
-def summarize_naively(newsletter: ScrapedNewsletter) -> str:
-    """Heuristic fallback used when no ANTHROPIC_API_KEY is configured."""
-    lines = [ln.strip() for ln in newsletter.raw_text.splitlines() if ln.strip()]
-    # De-dupe while preserving order (Smore often repeats headline text).
-    seen = set()
-    deduped = []
-    for ln in lines:
-        if ln not in seen:
-            seen.add(ln)
-            deduped.append(ln)
-
-    date_pattern = re.compile(
-        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}"
-        r"|\b\d{1,2}/\d{1,2}/\d{2,4}\b"
-        r"|\b\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?\b",
-    )
-    key_dates = [ln for ln in deduped if date_pattern.search(ln)][:10]
-
-    body = "\n".join(f"- {ln}" for ln in deduped[:40])
-    out = [f"Summary (auto-extracted, no ANTHROPIC_API_KEY set):\n{body}"]
-    if key_dates:
-        out.append("\nPossible dates/times mentioned:\n" + "\n".join(f"- {d}" for d in key_dates))
-    if newsletter.links:
-        out.append(
-            "\nLinks:\n"
-            + "\n".join(f"- {text}: {href}" for text, href in newsletter.links[:20])
-        )
-    return "\n".join(out)
-
-
-def build_email_body(newsletter: ScrapedNewsletter, digest: str) -> tuple[str, str]:
-    """Return (plain_text, html) email bodies."""
+def build_email_body(newsletter: ScrapedNewsletter) -> tuple[str, str]:
+    """Return (plain_text, html) email bodies containing the full scraped text."""
     plain = (
         f"{newsletter.title or 'Newsletter update'}\n"
         f"{newsletter.url}\n\n"
-        f"{digest}\n"
+        f"{newsletter.raw_text}\n"
     )
 
     def esc(s: str) -> str:
         return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    digest_html = esc(digest).replace("\n", "<br>")
+    body_html = esc(newsletter.raw_text).replace("\n", "<br>")
     html = f"""\
 <html><body style="font-family: -apple-system, Arial, sans-serif; max-width: 640px; margin: 0 auto;">
   <h2>{esc(newsletter.title or 'Newsletter update')}</h2>
   <p><a href="{esc(newsletter.url)}">{esc(newsletter.url)}</a></p>
-  <div>{digest_html}</div>
+  <div>{body_html}</div>
 </body></html>"""
     return plain, html
 
@@ -419,7 +349,7 @@ def main() -> int:
                 "No newsletter email found yet (or couldn't resolve its "
                 "link to a smore.com URL). Nothing to send. Try --url to "
                 "scrape a known link directly if you want to test the "
-                "scrape/summarize/email steps without inbox discovery.",
+                "scrape/email steps without inbox discovery.",
                 file=sys.stderr,
             )
             return 0
@@ -433,11 +363,8 @@ def main() -> int:
     print(f"Fetching {url} ...", file=sys.stderr)
     newsletter = scrape(url)
 
-    print("Summarizing ...", file=sys.stderr)
-    digest = summarize_with_claude(newsletter)
-
-    plain, html = build_email_body(newsletter, digest)
-    subject = f"Newsletter digest: {newsletter.title or url}"
+    plain, html = build_email_body(newsletter)
+    subject = f"Newsletter: {newsletter.title or url}"
 
     if args.dry_run:
         print(f"Subject: {subject}\n")
