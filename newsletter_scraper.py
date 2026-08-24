@@ -412,12 +412,17 @@ def main() -> int:
         print("Searching inbox for the latest newsletter link ...", file=sys.stderr)
         url = find_latest_newsletter_url()
         if not url:
+            # Not finding a matching email yet is the normal steady state
+            # between issues (or before the first one has arrived) - it's
+            # not a failure, so a scheduled run shouldn't show as red.
             print(
-                "Couldn't find a newsletter email or resolve its link to a "
-                "smore.com URL. Try --url to scrape a known link directly.",
+                "No newsletter email found yet (or couldn't resolve its "
+                "link to a smore.com URL). Nothing to send. Try --url to "
+                "scrape a known link directly if you want to test the "
+                "scrape/summarize/email steps without inbox discovery.",
                 file=sys.stderr,
             )
-            return 1
+            return 0
         print(f"Resolved: {url}", file=sys.stderr)
 
     slug = extract_slug(url)
