@@ -1,7 +1,12 @@
 name: Newsletter scraper email
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Specific flyer URL to scrape, skipping inbox discovery (for testing)"
+        required: false
+        type: string
   schedule:
     # Runs 13:00 UTC daily. The script only emails when a new issue's slug
     # differs from the last one it processed (tracked in .state/last_slug.txt),
@@ -34,7 +39,13 @@ jobs:
           SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python newsletter_scraper.py
+          TEST_URL: ${{ inputs.url }}
+        run: |
+          if [ -n "$TEST_URL" ]; then
+            python newsletter_scraper.py --url "$TEST_URL"
+          else
+            python newsletter_scraper.py
+          fi
 
       - name: Commit updated state
         run: |
